@@ -4,6 +4,10 @@ A Telegram bot for privately distributing files. Only pre-approved users
 can use it at all, and even then, every individual file needs a separate,
 time-limited admin approval before it's sent.
 
+# How I got the idea?
+
+I needed to give some files to my college juniors and college-mates for studies and notes, but last time I shared it with them, the information along with notes or study material was often not given to all or didn't reach them. So to make it transparent and easy to access, I made this bot. The idea is minimum access and maximum availability. The Files are locked, and only verified users can ask for access. It reduces unknown users from joining the system and also enables search access rather than bulk access to information. I'm using it on my Android device to keep it running 24/7, and it is working pretty well. I have some more ideas for this project, but for now it is serving its purpose.
+
 Built with [`python-telegram-bot`](https://github.com/python-telegram-bot/python-telegram-bot) (async/await style, v22.x).
 
 ---
@@ -222,7 +226,7 @@ Since the bot only needs outbound internet (long-polling, no inbound ports), it 
 
 ---
 
-## Known limitations / things to keep in mind
+## Known limitations/things to keep in mind
 
 - **A bot can't add itself to a private channel automatically** — if you
   want the bot to auto-index everything posted to a channel, you'd need
@@ -232,7 +236,7 @@ Since the bot only needs outbound internet (long-polling, no inbound ports), it 
   saved messages.
 - **`ADMIN_IDS` is read once at startup** from `config.py`. Adding a new
   admin means editing `config.py` and restarting the bot — admins aren't
-  managed the same dynamic way as regular authorized users.
+  managed the same dynamic way as regular authorised users.
 - **Expiry is checked lazily**, at the moment a user tries to open a
   file — there's no background job clearing out expired grants. This is
   fine functionally (an expired grant is just treated as "no access"),
@@ -253,4 +257,4 @@ Since the bot only needs outbound internet (long-polling, no inbound ports), it 
 
 ## License
 
-No license specified yet — add one (e.g. MIT) if you plan to make this repo public.
+No license needed; it is made with the help of AI and my own learnings.
