@@ -14,13 +14,19 @@ A Telegram bot with three jobs:
 
 Any number of admins can approve/deny both kinds of requests — whichever
 admin taps first "wins" (the pending request is removed immediately on the
-first tap), so two admins can't double-process the same request.
+first tap), so two admins can't double-process the same request. Admins can
+be managed two ways: permanently via ADMIN_IDS in config.py, or on the fly
+via /addadmin and /removeadmin.
 
 Files themselves are never stored on this machine. An admin registers a
-file by simply forwarding it to the bot once; Telegram keeps hosting the
-actual bytes, and the bot only ever remembers the file's `file_id` plus
-whatever name/keyword you give it. Delivery uses copy_message (not
-forward), so recipients never see where the file originally came from.
+file either by forwarding it to the bot once (asks for a name), or —if
+AUTO_INDEX_CHANNEL_ID is set in config.py— automatically, the moment it's
+posted to that channel (using the post's caption as the name). Either way,
+Telegram keeps hosting the actual bytes; the bot only ever remembers the
+file's `file_id` plus its name. Delivery uses copy_message (not forward),
+so recipients never see where the file originally came from. Files can be
+removed again with /deletefile — item IDs are never reused, so this never
+shifts or collides with any other file's ID, past or future.
 """
 
 import json
@@ -41,6 +47,14 @@ from telegram.ext import (
 
 from config import BOT_TOKEN, ADMIN_IDS, DEFAULT_ACCESS_DAYS
 
+try:
+    # Optional setting — only add this to config.py once you're ready to
+    # turn on channel auto-indexing. Falls back to "off" if it's not there
+    # yet, so existing config.py files (without this line) keep working.
+    from config import AUTO_INDEX_CHANNEL_ID
+except ImportError:
+    AUTO_INDEX_CHANNEL_ID = None
+
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
@@ -55,6 +69,7 @@ USERS_FILE = "users.json"
 LIBRARY_FILE = "library.json"
 ACCESS_FILE = "access.json"
 WISHLIST_FILE = "wishlist.json"
+ADMINS_FILE = "admins.json"
 
 # Conversation states
 ADD_FILE_WAITING_NAME = 1
@@ -126,12 +141,34 @@ def append_wishlist(entry: dict) -> None:
     _atomic_write_json(WISHLIST_FILE, data)
 
 
+def load_admins() -> dict:
+    # Admins added/removed at runtime via /addadmin and /removeadmin, kept
+    # separate from ADMIN_IDS in config.py. Config-file admins are the
+    # permanent "founding" admins (can only be changed by editing config.py
+    # and restarting) — this file holds everyone added on top of that.
+    return _load_json(ADMINS_FILE, {"extra_admins": []})
+
+
+def save_admins(data: dict) -> None:
+    _atomic_write_json(ADMINS_FILE, data)
+
+
 # ---------------------------------------------------------------------------
 # Authorization helpers
 # ---------------------------------------------------------------------------
 
 def is_admin(user_id: int) -> bool:
-    return user_id in ADMIN_IDS
+    # Checked fresh every call (not cached), so /addadmin and /removeadmin
+    # take effect immediately without needing a restart.
+    if user_id in ADMIN_IDS:
+        return True
+    return user_id in load_admins()["extra_admins"]
+
+
+def all_admin_ids() -> list:
+    """Every admin who should get notifications: config.py admins plus
+    anyone added at runtime, with duplicates removed."""
+    return list(dict.fromkeys(ADMIN_IDS + load_admins()["extra_admins"]))
 
 
 def is_authorized(user_id: int) -> bool:
@@ -280,7 +317,7 @@ async def cb_request_auth(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ]
     )
     handle = f"@{user.username}" if user.username else "(no username)"
-    for admin_id in ADMIN_IDS:
+    for admin_id in all_admin_ids():
         try:
             await context.bot.send_message(
                 chat_id=admin_id,
@@ -390,14 +427,75 @@ async def cmd_removeuser(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 @admin_only
+async def cmd_addadmin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("Usage: /addadmin <telegram_id>")
+        return
+    try:
+        target_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("That doesn't look like a valid numeric Telegram ID.")
+        return
+
+    if is_admin(target_id):
+        await update.message.reply_text("That user is already an admin.")
+        return
+
+    admins = load_admins()
+    admins["extra_admins"].append(target_id)
+    save_admins(admins)
+    await update.message.reply_text(f"✅ User {target_id} is now an admin — effective immediately, no restart needed.")
+    try:
+        await context.bot.send_message(
+            chat_id=target_id,
+            text="✅ You've been made an admin of this bot. Send /menu to see admin options.",
+        )
+    except Exception:
+        pass  # they may not have started a chat with the bot yet — that's fine
+
+
+@admin_only
+async def cmd_removeadmin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("Usage: /removeadmin <telegram_id>")
+        return
+    try:
+        target_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("That doesn't look like a valid numeric Telegram ID.")
+        return
+
+    if target_id in ADMIN_IDS:
+        await update.message.reply_text(
+            "That admin is set directly in config.py, not added at runtime — "
+            "remove them there and restart the bot instead. This command only "
+            "manages admins added via /addadmin."
+        )
+        return
+
+    admins = load_admins()
+    if target_id not in admins["extra_admins"]:
+        await update.message.reply_text("That user isn't a runtime-added admin.")
+        return
+    admins["extra_admins"].remove(target_id)
+    save_admins(admins)
+    await update.message.reply_text(f"🚫 User {target_id} is no longer an admin.")
+
+
+@admin_only
 async def cmd_listusers(update: Update, context: ContextTypes.DEFAULT_TYPE):
     users = load_users()
-    lines = ["**Admins:**"] + [f"- {a}" for a in ADMIN_IDS]
+    admins = load_admins()
+
+    lines = ["**Admins (config.py — edit config.py + restart to change):**"]
+    lines += [f"- {a}" for a in ADMIN_IDS] if ADMIN_IDS else ["(none)"]
+
+    lines.append("\n**Admins (added at runtime via /addadmin):**")
+    lines += [f"- {a}" for a in admins["extra_admins"]] if admins["extra_admins"] else ["(none)"]
+
     lines.append("\n**Authorized users:**")
-    if users["authorized"]:
-        lines += [f"- {u}" for u in users["authorized"]]
-    else:
-        lines.append("(none yet)")
+    lines += [f"- {u}" for u in users["authorized"]] if users["authorized"] else ["(none yet)"]
+
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 
@@ -581,7 +679,7 @@ async def cb_request_file_access(update: Update, context: ContextTypes.DEFAULT_T
         ]
     )
     handle = f"@{user.username}" if user.username else "(no username)"
-    for admin_id in ADMIN_IDS:
+    for admin_id in all_admin_ids():
         try:
             await context.bot.send_message(
                 chat_id=admin_id,
@@ -677,7 +775,7 @@ async def cb_request_missing_file(update: Update, context: ContextTypes.DEFAULT_
     await query.message.reply_text("Thanks — the admins have been notified.")
 
     handle = f"@{user.username}" if user.username else "(no username)"
-    for admin_id in ADMIN_IDS:
+    for admin_id in all_admin_ids():
         try:
             await context.bot.send_message(
                 chat_id=admin_id,
@@ -834,12 +932,57 @@ async def cmd_rename(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"✅ Renamed '{old_name}' → '{new_name}' (#{item_id}).")
 
 
+@admin_only
+async def cmd_deletefile(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text(
+            "Usage: /deletefile <id>\n\nUse /listfiles to find a file's ID."
+        )
+        return
+
+    item_id = context.args[0]
+    library = load_library()
+    item = library["items"].pop(item_id, None)
+    if item is None:
+        await update.message.reply_text(f"No file with ID #{item_id}. Use /listfiles to check.")
+        return
+
+    # _next_item_id is never touched here — it only ever counts up, whether
+    # a file is deleted or not. That's what guarantees IDs are never reused:
+    # a deleted #7 stays retired forever, and the next new file still gets
+    # whatever the counter is up to, never #7 again.
+    save_library(library)
+
+    # Clean up anything in access.json that referenced this now-deleted
+    # file, so it doesn't quietly accumulate references to nothing.
+    access = load_access()
+    removed_grants = [k for k in access["grants"] if k.split(":", 1)[1] == item_id]
+    for key in removed_grants:
+        del access["grants"][key]
+    removed_pending = [
+        rid for rid, req in access["pending_requests"].items() if req["item_id"] == item_id
+    ]
+    for rid in removed_pending:
+        del access["pending_requests"][rid]
+    if removed_grants or removed_pending:
+        save_access(access)
+
+    await update.message.reply_text(f"🗑 Deleted '{item['name']}' (#{item_id}).")
+
+
 # ---------------------------------------------------------------------------
 # Admin: registering a new file (forward the file to the bot to start)
 # ---------------------------------------------------------------------------
 
-@admin_only
 async def addfile_received(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    # Checked here (not via a static filter or the @admin_only decorator) so
+    # that admins added at runtime via /addadmin are recognized immediately,
+    # and so a non-admin sending a file is silently ignored — same as
+    # before, rather than getting a "for admins only" reply for something
+    # as ordinary as sharing a photo in chat.
+    if not update.effective_user or not is_admin(update.effective_user.id):
+        return ConversationHandler.END
+
     message = update.message
 
     if message.document:
@@ -873,6 +1016,26 @@ async def addfile_received(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     return ADD_FILE_WAITING_NAME
 
 
+def _register_library_item(name: str, file_type: str, source_chat_id: int, source_message_id: int, added_by) -> str:
+    """Shared by both the manual forward-to-bot flow and channel
+    auto-indexing. Returns the new item's ID. _next_item_id only ever goes
+    up — that's the whole mechanism that keeps IDs permanent and unique,
+    whether items get deleted later or not."""
+    library = load_library()
+    item_id = str(library["_next_item_id"])
+    library["_next_item_id"] += 1
+    library["items"][item_id] = {
+        "name": name,
+        "file_type": file_type,
+        "source_chat_id": source_chat_id,
+        "source_message_id": source_message_id,
+        "added_by": added_by,
+        "added_at": datetime.now().strftime(DATE_FMT),
+    }
+    save_library(library)
+    return item_id
+
+
 async def addfile_name_received(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     name = update.message.text.strip()
     if not name:
@@ -884,18 +1047,13 @@ async def addfile_name_received(update: Update, context: ContextTypes.DEFAULT_TY
         await update.message.reply_text("Something went wrong — please forward the file again.")
         return ConversationHandler.END
 
-    library = load_library()
-    item_id = str(library["_next_item_id"])
-    library["_next_item_id"] += 1
-    library["items"][item_id] = {
-        "name": name,
-        "file_type": pending["file_type"],
-        "source_chat_id": pending["source_chat_id"],
-        "source_message_id": pending["source_message_id"],
-        "added_by": update.effective_user.id,
-        "added_at": datetime.now().strftime(DATE_FMT),
-    }
-    save_library(library)
+    item_id = _register_library_item(
+        name=name,
+        file_type=pending["file_type"],
+        source_chat_id=pending["source_chat_id"],
+        source_message_id=pending["source_message_id"],
+        added_by=update.effective_user.id,
+    )
 
     await update.message.reply_text(f"✅ Added '{name}' to the library (ID #{item_id}).")
     return ConversationHandler.END
@@ -905,6 +1063,106 @@ async def addfile_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     context.user_data.pop("pending_file", None)
     await update.message.reply_text("Cancelled — file was not added.")
     return ConversationHandler.END
+
+
+# ---------------------------------------------------------------------------
+# Channel auto-indexing (bot must be an admin in the channel)
+# ---------------------------------------------------------------------------
+# If AUTO_INDEX_CHANNEL_ID is set in config.py, every file posted to that
+# specific channel is registered automatically — no manual forward needed.
+# If it ISN'T set yet, the bot instead helps admins discover a channel's ID
+# the moment it starts receiving posts from it (e.g. right after being made
+# an admin there), so they know what to put in config.py.
+
+async def channel_post_received(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    post = update.channel_post
+    if not post:
+        return
+
+    if AUTO_INDEX_CHANNEL_ID is not None and post.chat_id == AUTO_INDEX_CHANNEL_ID:
+        await _auto_index_channel_post(post, context)
+        return
+
+    if AUTO_INDEX_CHANNEL_ID is None:
+        await _notify_channel_id_once(post.chat, context)
+    # else: AUTO_INDEX_CHANNEL_ID is set to a *different* channel than this
+    # post came from — deliberately do nothing, so the bot being an admin
+    # in some other channel for unrelated reasons never gets auto-indexed
+    # or spams admins about it.
+
+
+async def _auto_index_channel_post(post, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if post.document:
+        file_id = post.document.file_id
+        file_type = "document"
+        fallback_name = post.document.file_name
+    elif post.video:
+        file_id = post.video.file_id
+        file_type = "video"
+        fallback_name = getattr(post.video, "file_name", None)
+    elif post.audio:
+        file_id = post.audio.file_id
+        file_type = "audio"
+        fallback_name = getattr(post.audio, "file_name", None)
+    elif post.voice:
+        file_id = post.voice.file_id
+        file_type = "voice"
+        fallback_name = None
+    elif post.photo:
+        file_id = post.photo[-1].file_id
+        file_type = "photo"
+        fallback_name = None
+    else:
+        return  # text-only channel post, or a type we don't handle — ignore
+
+    # Prefer the post's caption as the name (what you typed when posting);
+    # fall back to the original filename Telegram carries on documents,
+    # then a generic placeholder as a last resort. /rename fixes any of
+    # these afterward if the auto-picked name isn't quite right.
+    name = (post.caption or fallback_name or "Untitled file").strip()
+
+    item_id = _register_library_item(
+        name=name,
+        file_type=file_type,
+        source_chat_id=post.chat_id,
+        source_message_id=post.message_id,
+        added_by="auto-index",
+    )
+
+    for admin_id in all_admin_ids():
+        try:
+            await context.bot.send_message(
+                chat_id=admin_id,
+                text=(
+                    f"📥 Auto-indexed a new channel post as '{name}' (#{item_id}).\n"
+                    f"Use /rename {item_id} <name> if that name needs fixing."
+                ),
+            )
+        except Exception as e:
+            logger.warning(f"Couldn't notify admin {admin_id}: {e}")
+
+
+async def _notify_channel_id_once(chat, context: ContextTypes.DEFAULT_TYPE) -> None:
+    # In-memory only (resets on restart) — just enough to stop this from
+    # re-notifying on every single post in an unconfigured channel.
+    notified = context.bot_data.setdefault("notified_channel_ids", set())
+    if chat.id in notified:
+        return
+    notified.add(chat.id)
+
+    for admin_id in all_admin_ids():
+        try:
+            await context.bot.send_message(
+                chat_id=admin_id,
+                text=(
+                    f"ℹ️ The bot is receiving posts from the channel '{chat.title}' "
+                    f"(ID: {chat.id}), but auto-indexing isn't turned on for it yet.\n\n"
+                    f"To enable it, add this line to config.py and restart the bot:\n"
+                    f"AUTO_INDEX_CHANNEL_ID = {chat.id}"
+                ),
+            )
+        except Exception as e:
+            logger.warning(f"Couldn't notify admin {admin_id}: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -941,10 +1199,16 @@ def main():
     )
 
     # --- Add-file conversation (admin forwards a file to start) ---
+    # No admin filter here on purpose — admin_only status is now dynamic
+    # (config.py admins + runtime-added ones), so the check happens inside
+    # addfile_received itself instead of a filter fixed at startup.
+    # filters.UpdateType.MESSAGE restricts this to normal chat messages —
+    # channel posts (handled separately below, for auto-indexing) have no
+    # sender at all, so they must never reach this handler.
     addfile_conv = ConversationHandler(
         entry_points=[
             MessageHandler(
-                filters.User(user_id=ADMIN_IDS)
+                filters.UpdateType.MESSAGE
                 & (
                     filters.Document.ALL
                     | filters.VIDEO
@@ -973,15 +1237,35 @@ def main():
     app.add_handler(CommandHandler("myid", cmd_myid))
     app.add_handler(CommandHandler("adduser", cmd_adduser))
     app.add_handler(CommandHandler("removeuser", cmd_removeuser))
+    app.add_handler(CommandHandler("addadmin", cmd_addadmin))
+    app.add_handler(CommandHandler("removeadmin", cmd_removeadmin))
     app.add_handler(CommandHandler("listusers", cmd_listusers))
     app.add_handler(CommandHandler("pending", cmd_pending))
     app.add_handler(CommandHandler("wishlist", cmd_wishlist))
     app.add_handler(CommandHandler("listfiles", cmd_listfiles))
     app.add_handler(CommandHandler("rename", cmd_rename))
+    app.add_handler(CommandHandler("deletefile", cmd_deletefile))
     app.add_handler(CommandHandler("myaccess", cmd_myaccess))
 
     app.add_handler(search_conv)
     app.add_handler(addfile_conv)
+
+    # Channel posts (for auto-indexing) are a completely different update
+    # type from normal messages — filters.UpdateType.CHANNEL_POST is what
+    # actually catches them; a plain MessageHandler filter alone wouldn't.
+    app.add_handler(
+        MessageHandler(
+            filters.UpdateType.CHANNEL_POST
+            & (
+                filters.Document.ALL
+                | filters.VIDEO
+                | filters.AUDIO
+                | filters.VOICE
+                | filters.PHOTO
+            ),
+            channel_post_received,
+        )
+    )
 
     app.add_handler(CallbackQueryHandler(cb_request_auth, pattern="^reqauth$"))
     app.add_handler(CallbackQueryHandler(cb_auth_decision, pattern="^auth(ok|no):"))
