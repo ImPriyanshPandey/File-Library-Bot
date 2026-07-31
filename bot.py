@@ -5,14 +5,14 @@ A Telegram bot with three jobs:
 
 1. Search a library of files by word or by first letter, and deliver the
    actual file (not just a link) to the user.
-2. Only "authorized" users can use the bot at all (Layer 1) — random
+2. Only "authorized" users can use the bot at all (Layer 1) - random
    strangers who find the bot publicly on Telegram can't do anything with it.
 3. Even an authorized user needs a separate, time-limited approval from an
-   admin before they can actually receive any *specific* file (Layer 2) —
+   admin before they can actually receive any *specific* file (Layer 2) -
    this is the "protect file info, not everyone needs every file every time"
    layer. Access to a file expires automatically after DEFAULT_ACCESS_DAYS.
 
-Any number of admins can approve/deny both kinds of requests — whichever
+Any number of admins can approve/deny both kinds of requests - whichever
 admin taps first "wins" (the pending request is removed immediately on the
 first tap), so two admins can't double-process the same request. Admins can
 be managed two ways: permanently via ADMIN_IDS in config.py, or on the fly
@@ -25,14 +25,18 @@ posted to that channel (using the post's caption as the name). Either way,
 Telegram keeps hosting the actual bytes; the bot only ever remembers the
 file's `file_id` plus its name. Delivery uses copy_message (not forward),
 so recipients never see where the file originally came from. Files can be
-removed again with /deletefile — item IDs are never reused, so this never
+removed again with /deletefile - item IDs are never reused, so this never
 shifts or collides with any other file's ID, past or future.
 """
 
 import json
 import os
+import io
+import zipfile
+import asyncio
 import logging
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -48,12 +52,28 @@ from telegram.ext import (
 from config import BOT_TOKEN, ADMIN_IDS, DEFAULT_ACCESS_DAYS
 
 try:
-    # Optional setting — only add this to config.py once you're ready to
+    # Optional setting - only add this to config.py once you're ready to
     # turn on channel auto-indexing. Falls back to "off" if it's not there
     # yet, so existing config.py files (without this line) keep working.
     from config import AUTO_INDEX_CHANNEL_ID
 except ImportError:
     AUTO_INDEX_CHANNEL_ID = None
+
+try:
+    # Optional settings for the automatic daily backup. Falls back to a
+    # sensible default (11:59 PM, India time) if config.py doesn't have
+    # these yet, so existing config.py files keep working unchanged.
+    from config import BACKUP_HOUR, BACKUP_MINUTE, BACKUP_TIMEZONE
+except ImportError:
+    BACKUP_HOUR, BACKUP_MINUTE, BACKUP_TIMEZONE = 23, 59, "Asia/Kolkata"
+
+try:
+    # Who actually receives the backup - just this one Telegram ID, not
+    # every admin. Falls back to the first ID in ADMIN_IDS if config.py
+    # doesn't set this explicitly.
+    from config import BACKUP_RECIPIENT_ID
+except ImportError:
+    BACKUP_RECIPIENT_ID = ADMIN_IDS[0] if ADMIN_IDS else None
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -84,7 +104,7 @@ DATE_FMT = "%Y-%m-%d %H:%M"
 # Every save goes through _atomic_write_json: write to a temp file, then
 # os.replace() it into place. os.replace is atomic on both Windows and
 # Linux, so a crash or power loss mid-save can never leave a half-written,
-# corrupted JSON file behind — you either get the old version or the new
+# corrupted JSON file behind - you either get the old version or the new
 # one, never a broken one.
 
 def _atomic_write_json(path: str, data: dict) -> None:
@@ -145,7 +165,7 @@ def load_admins() -> dict:
     # Admins added/removed at runtime via /addadmin and /removeadmin, kept
     # separate from ADMIN_IDS in config.py. Config-file admins are the
     # permanent "founding" admins (can only be changed by editing config.py
-    # and restarting) — this file holds everyone added on top of that.
+    # and restarting) - this file holds everyone added on top of that.
     return _load_json(ADMINS_FILE, {"extra_admins": []})
 
 
@@ -172,7 +192,7 @@ def all_admin_ids() -> list:
 
 
 def is_authorized(user_id: int) -> bool:
-    # Admins are always implicitly authorized — no need to also add them
+    # Admins are always implicitly authorized - no need to also add them
     # to the authorized list.
     if is_admin(user_id):
         return True
@@ -251,7 +271,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     if already_pending:
         await update.message.reply_text(
-            "You've already requested access — an admin hasn't responded yet. "
+            "You've already requested access - an admin hasn't responded yet. "
             "Please wait, you'll be notified here as soon as they do."
         )
         return
@@ -287,13 +307,13 @@ async def cb_request_auth(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
 
     if is_authorized(user.id):
-        await query.edit_message_text("You're already authorized — send /start.")
+        await query.edit_message_text("You're already authorized - send /start.")
         return
 
     users = load_users()
 
     if any(req["user_id"] == user.id for req in users["pending_auth_requests"].values()):
-        await query.edit_message_text("You've already got a pending request — hang tight.")
+        await query.edit_message_text("You've already got a pending request - hang tight.")
         return
 
     req_id = str(users["_next_auth_id"])
@@ -403,7 +423,7 @@ async def cmd_adduser(update: Update, context: ContextTypes.DEFAULT_TYPE):
             text="✅ You've been granted access to the bot! Send /start to begin.",
         )
     except Exception:
-        pass  # they may not have started a chat with the bot yet — that's fine
+        pass  # they may not have started a chat with the bot yet - that's fine
 
 
 @admin_only
@@ -444,14 +464,14 @@ async def cmd_addadmin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     admins = load_admins()
     admins["extra_admins"].append(target_id)
     save_admins(admins)
-    await update.message.reply_text(f"✅ User {target_id} is now an admin — effective immediately, no restart needed.")
+    await update.message.reply_text(f"✅ User {target_id} is now an admin - effective immediately, no restart needed.")
     try:
         await context.bot.send_message(
             chat_id=target_id,
             text="✅ You've been made an admin of this bot. Send /menu to see admin options.",
         )
     except Exception:
-        pass  # they may not have started a chat with the bot yet — that's fine
+        pass  # they may not have started a chat with the bot yet - that's fine
 
 
 @admin_only
@@ -467,7 +487,7 @@ async def cmd_removeadmin(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if target_id in ADMIN_IDS:
         await update.message.reply_text(
-            "That admin is set directly in config.py, not added at runtime — "
+            "That admin is set directly in config.py, not added at runtime - "
             "remove them there and restart the bot instead. This command only "
             "manages admins added via /addadmin."
         )
@@ -487,7 +507,7 @@ async def cmd_listusers(update: Update, context: ContextTypes.DEFAULT_TYPE):
     users = load_users()
     admins = load_admins()
 
-    lines = ["**Admins (config.py — edit config.py + restart to change):**"]
+    lines = ["**Admins (config.py - edit config.py + restart to change):**"]
     lines += [f"- {a}" for a in ADMIN_IDS] if ADMIN_IDS else ["(none)"]
 
     lines.append("\n**Admins (added at runtime via /addadmin):**")
@@ -590,7 +610,7 @@ def _active_grant(access: dict, user_id: int, item_id: str) -> dict | None:
 
 async def _deliver_file(context: ContextTypes.DEFAULT_TYPE, chat_id: int, item: dict) -> None:
     # copy_message (not forward_message) so the recipient sees it as coming
-    # straight from the bot — no "Forwarded from" tag revealing the private
+    # straight from the bot - no "Forwarded from" tag revealing the private
     # channel or chat the file was originally registered from.
     await context.bot.copy_message(
         chat_id=chat_id,
@@ -651,12 +671,12 @@ async def cb_request_file_access(update: Update, context: ContextTypes.DEFAULT_T
         for req in access["pending_requests"].values()
     )
     if already_pending:
-        await query.message.reply_text("You've already requested this — waiting on an admin.")
+        await query.message.reply_text("You've already requested this - waiting on an admin.")
         return
 
     if _active_grant(access, user.id, item_id):
         await _deliver_file(context, user.id, item)
-        await query.message.reply_text("You already have access — here it is again.")
+        await query.message.reply_text("You already have access - here it is again.")
         return
 
     req_id = str(access["_next_request_id"])
@@ -772,7 +792,7 @@ async def cb_request_missing_file(update: Update, context: ContextTypes.DEFAULT_
             "requested_at": datetime.now().strftime(DATE_FMT),
         }
     )
-    await query.message.reply_text("Thanks — the admins have been notified.")
+    await query.message.reply_text("Thanks - the admins have been notified.")
 
     handle = f"@{user.username}" if user.username else "(no username)"
     for admin_id in all_admin_ids():
@@ -872,24 +892,24 @@ async def cmd_wishlist(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not items:
         await update.message.reply_text("No file requests logged yet.")
         return
-    lines = [f"- '{i['name']}' — requested by ID {i['requested_by']} on {i['requested_at']}" for i in items]
+    lines = [f"- '{i['name']}' - requested by ID {i['requested_by']} on {i['requested_at']}" for i in items]
     await update.message.reply_text("**Last 20 requested-but-missing files:**\n" + "\n".join(lines), parse_mode="Markdown")
 
 
 @admin_only
 async def cmd_listfiles(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Mainly here so an admin can look up a file's ID before using /rename —
+    # Mainly here so an admin can look up a file's ID before using /rename -
     # the ID isn't shown anywhere else during normal day-to-day use.
     library = load_library()
     items = library["items"]
     if not items:
-        await update.message.reply_text("The library is empty — forward a file to the bot to add one.")
+        await update.message.reply_text("The library is empty - forward a file to the bot to add one.")
         return
     lines = [
-        f"#{item_id} — {item['name']}"
+        f"#{item_id} - {item['name']}"
         for item_id, item in sorted(items.items(), key=lambda pair: pair[1]["name"].lower())
     ]
-    # Telegram caps messages at 4096 characters — chunk the list so a large
+    # Telegram caps messages at 4096 characters - chunk the list so a large
     # library doesn't silently fail to send.
     chunk = []
     length = 0
@@ -926,7 +946,7 @@ async def cmd_rename(update: Update, context: ContextTypes.DEFAULT_TYPE):
     old_name = item["name"]
     item["name"] = new_name
     save_library(library)
-    # Renaming only ever changes what the file is called and searched by —
+    # Renaming only ever changes what the file is called and searched by -
     # the underlying file_id/source message, and everyone's existing access
     # grants for this item_id, are untouched.
     await update.message.reply_text(f"✅ Renamed '{old_name}' → '{new_name}' (#{item_id}).")
@@ -947,7 +967,7 @@ async def cmd_deletefile(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"No file with ID #{item_id}. Use /listfiles to check.")
         return
 
-    # _next_item_id is never touched here — it only ever counts up, whether
+    # _next_item_id is never touched here - it only ever counts up, whether
     # a file is deleted or not. That's what guarantees IDs are never reused:
     # a deleted #7 stays retired forever, and the next new file still gets
     # whatever the counter is up to, never #7 again.
@@ -971,13 +991,104 @@ async def cmd_deletefile(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ---------------------------------------------------------------------------
+# Daily backup - sends the current data files to one specific person only
+# ---------------------------------------------------------------------------
+# Since the bot now lives permanently on one device, there's no more
+# juggling JSON files between a laptop/phone by hand. This is purely a
+# safety net (so data survives even if that one device is lost, wiped, or
+# has a bad update) and a way to peek at current data from any other
+# device - it arrives as an ordinary Telegram message, nothing to install,
+# run, or configure on the receiving end. Sent only to BACKUP_RECIPIENT_ID
+# (config.py) - deliberately NOT broadcast to every admin, since this data
+# is sensitive and there's no reason more people need a copy of it.
+
+BACKUP_FILES = [USERS_FILE, LIBRARY_FILE, ACCESS_FILE, WISHLIST_FILE, ADMINS_FILE]
+
+
+def _build_backup_zip() -> tuple[bytes, list[str]]:
+    """Zips up whichever of the data files currently exist. Built entirely
+    in memory (io.BytesIO) - no temp file ever touches disk, so there's
+    nothing left over to clean up afterward."""
+    buffer = io.BytesIO()
+    included = []
+    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as zf:
+        for filename in BACKUP_FILES:
+            if os.path.exists(filename):
+                zf.write(filename)
+                included.append(filename)
+    return buffer.getvalue(), included
+
+
+async def send_backup(bot, reason: str) -> None:
+    if BACKUP_RECIPIENT_ID is None:
+        logger.warning("Backup skipped - no BACKUP_RECIPIENT_ID and no ADMIN_IDS configured.")
+        return
+
+    zip_bytes, included = _build_backup_zip()
+    if not included:
+        return  # nothing's been created yet - nothing to back up
+
+    tz = ZoneInfo(BACKUP_TIMEZONE)
+    stamp = datetime.now(tz).strftime("%Y-%m-%d_%H-%M")
+    caption = f"🗂 {reason} - {stamp}\nIncludes: {', '.join(included)}"
+
+    try:
+        await bot.send_document(
+            chat_id=BACKUP_RECIPIENT_ID,
+            document=zip_bytes,
+            filename=f"file-library-bot-backup_{stamp}.zip",
+            caption=caption,
+        )
+    except Exception as e:
+        logger.warning(f"Couldn't send backup to {BACKUP_RECIPIENT_ID}: {e}")
+
+
+@admin_only
+async def cmd_backup(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Preparing backup...")
+    await send_backup(context.bot, reason="Manual backup")
+
+
+def _seconds_until_next_run(now: datetime, hour: int, minute: int) -> float:
+    """Pure function (no sleeping) so the scheduling math can be tested in
+    isolation. Returns how many seconds from `now` until the next occurrence
+    of hour:minute - today if that time hasn't passed yet, tomorrow if it has."""
+    target = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    if target <= now:
+        target += timedelta(days=1)
+    return (target - now).total_seconds()
+
+
+async def _daily_backup_loop(app) -> None:
+    tz = ZoneInfo(BACKUP_TIMEZONE)
+    while True:
+        wait_seconds = _seconds_until_next_run(datetime.now(tz), BACKUP_HOUR, BACKUP_MINUTE)
+        await asyncio.sleep(wait_seconds)
+        try:
+            await send_backup(app.bot, reason="Scheduled daily backup")
+        except Exception as e:
+            logger.warning(f"Daily backup failed: {e}")
+        # Sleep briefly past the trigger moment before the next loop
+        # iteration recalculates - avoids any chance of firing twice if a
+        # send took long enough to land right on the boundary.
+        await asyncio.sleep(5)
+
+
+async def _on_startup(app) -> None:
+    # Application.create_task ties this background loop to the app's own
+    # lifecycle, so it's cancelled cleanly on shutdown instead of being an
+    # orphaned asyncio task.
+    app.create_task(_daily_backup_loop(app))
+
+
+# ---------------------------------------------------------------------------
 # Admin: registering a new file (forward the file to the bot to start)
 # ---------------------------------------------------------------------------
 
 async def addfile_received(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     # Checked here (not via a static filter or the @admin_only decorator) so
     # that admins added at runtime via /addadmin are recognized immediately,
-    # and so a non-admin sending a file is silently ignored — same as
+    # and so a non-admin sending a file is silently ignored - same as
     # before, rather than getting a "for admins only" reply for something
     # as ordinary as sharing a photo in chat.
     if not update.effective_user or not is_admin(update.effective_user.id):
@@ -1011,7 +1122,7 @@ async def addfile_received(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     }
     await message.reply_text(
         "Got the file! What name should this be listed under? "
-        "(this is exactly what users will search for — /cancel to stop)"
+        "(this is exactly what users will search for - /cancel to stop)"
     )
     return ADD_FILE_WAITING_NAME
 
@@ -1019,7 +1130,7 @@ async def addfile_received(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 def _register_library_item(name: str, file_type: str, source_chat_id: int, source_message_id: int, added_by) -> str:
     """Shared by both the manual forward-to-bot flow and channel
     auto-indexing. Returns the new item's ID. _next_item_id only ever goes
-    up — that's the whole mechanism that keeps IDs permanent and unique,
+    up - that's the whole mechanism that keeps IDs permanent and unique,
     whether items get deleted later or not."""
     library = load_library()
     item_id = str(library["_next_item_id"])
@@ -1044,7 +1155,7 @@ async def addfile_name_received(update: Update, context: ContextTypes.DEFAULT_TY
 
     pending = context.user_data.pop("pending_file", None)
     if not pending:
-        await update.message.reply_text("Something went wrong — please forward the file again.")
+        await update.message.reply_text("Something went wrong - please forward the file again.")
         return ConversationHandler.END
 
     item_id = _register_library_item(
@@ -1061,7 +1172,7 @@ async def addfile_name_received(update: Update, context: ContextTypes.DEFAULT_TY
 
 async def addfile_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data.pop("pending_file", None)
-    await update.message.reply_text("Cancelled — file was not added.")
+    await update.message.reply_text("Cancelled - file was not added.")
     return ConversationHandler.END
 
 
@@ -1069,7 +1180,7 @@ async def addfile_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 # Channel auto-indexing (bot must be an admin in the channel)
 # ---------------------------------------------------------------------------
 # If AUTO_INDEX_CHANNEL_ID is set in config.py, every file posted to that
-# specific channel is registered automatically — no manual forward needed.
+# specific channel is registered automatically - no manual forward needed.
 # If it ISN'T set yet, the bot instead helps admins discover a channel's ID
 # the moment it starts receiving posts from it (e.g. right after being made
 # an admin there), so they know what to put in config.py.
@@ -1086,7 +1197,7 @@ async def channel_post_received(update: Update, context: ContextTypes.DEFAULT_TY
     if AUTO_INDEX_CHANNEL_ID is None:
         await _notify_channel_id_once(post.chat, context)
     # else: AUTO_INDEX_CHANNEL_ID is set to a *different* channel than this
-    # post came from — deliberately do nothing, so the bot being an admin
+    # post came from - deliberately do nothing, so the bot being an admin
     # in some other channel for unrelated reasons never gets auto-indexed
     # or spams admins about it.
 
@@ -1113,7 +1224,7 @@ async def _auto_index_channel_post(post, context: ContextTypes.DEFAULT_TYPE) -> 
         file_type = "photo"
         fallback_name = None
     else:
-        return  # text-only channel post, or a type we don't handle — ignore
+        return  # text-only channel post, or a type we don't handle - ignore
 
     # Prefer the post's caption as the name (what you typed when posting);
     # fall back to the original filename Telegram carries on documents,
@@ -1143,7 +1254,7 @@ async def _auto_index_channel_post(post, context: ContextTypes.DEFAULT_TYPE) -> 
 
 
 async def _notify_channel_id_once(chat, context: ContextTypes.DEFAULT_TYPE) -> None:
-    # In-memory only (resets on restart) — just enough to stop this from
+    # In-memory only (resets on restart) - just enough to stop this from
     # re-notifying on every single post in an unconfigured channel.
     notified = context.bot_data.setdefault("notified_channel_ids", set())
     if chat.id in notified:
@@ -1174,7 +1285,7 @@ async def fallback_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_authorized(user.id):
         await cmd_start(update, context)
         return
-    await update.message.reply_text("Not sure what you mean — send /menu to see your options.")
+    await update.message.reply_text("Not sure what you mean - send /menu to see your options.")
 
 
 # ---------------------------------------------------------------------------
@@ -1182,7 +1293,7 @@ async def fallback_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ---------------------------------------------------------------------------
 
 def main():
-    app = Application.builder().token(BOT_TOKEN).build()
+    app = Application.builder().token(BOT_TOKEN).post_init(_on_startup).build()
 
     # --- Search conversation ---
     search_conv = ConversationHandler(
@@ -1199,10 +1310,10 @@ def main():
     )
 
     # --- Add-file conversation (admin forwards a file to start) ---
-    # No admin filter here on purpose — admin_only status is now dynamic
+    # No admin filter here on purpose - admin_only status is now dynamic
     # (config.py admins + runtime-added ones), so the check happens inside
     # addfile_received itself instead of a filter fixed at startup.
-    # filters.UpdateType.MESSAGE restricts this to normal chat messages —
+    # filters.UpdateType.MESSAGE restricts this to normal chat messages -
     # channel posts (handled separately below, for auto-indexing) have no
     # sender at all, so they must never reach this handler.
     addfile_conv = ConversationHandler(
@@ -1245,13 +1356,14 @@ def main():
     app.add_handler(CommandHandler("listfiles", cmd_listfiles))
     app.add_handler(CommandHandler("rename", cmd_rename))
     app.add_handler(CommandHandler("deletefile", cmd_deletefile))
+    app.add_handler(CommandHandler("backup", cmd_backup))
     app.add_handler(CommandHandler("myaccess", cmd_myaccess))
 
     app.add_handler(search_conv)
     app.add_handler(addfile_conv)
 
     # Channel posts (for auto-indexing) are a completely different update
-    # type from normal messages — filters.UpdateType.CHANNEL_POST is what
+    # type from normal messages - filters.UpdateType.CHANNEL_POST is what
     # actually catches them; a plain MessageHandler filter alone wouldn't.
     app.add_handler(
         MessageHandler(
